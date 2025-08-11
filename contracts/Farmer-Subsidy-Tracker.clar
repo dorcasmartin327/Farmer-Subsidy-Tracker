@@ -51,6 +51,19 @@
     }
 )
 
+(define-map farmer-subsidy-history
+    {
+        farmer-id: principal,
+        subsidy-id: uint,
+    }
+    {
+        block-height: uint,
+        amount: uint,
+        subsidy-type: (string-ascii 30),
+        status: (string-ascii 20),
+    }
+)
+
 (define-data-var next-subsidy-id uint u1)
 
 (define-private (is-contract-owner)
@@ -182,6 +195,15 @@
             status: "pending",
             description: description,
         })
+        (map-set farmer-subsidy-history {
+            farmer-id: tx-sender,
+            subsidy-id: subsidy-id,
+        } {
+            block-height: stacks-block-height,
+            amount: calculated-amount,
+            subsidy-type: subsidy-type,
+            status: "pending",
+        })
         (var-set next-subsidy-id (+ subsidy-id u1))
         (ok subsidy-id)
     )
@@ -218,6 +240,15 @@
         (var-set total-subsidies-distributed
             (+ (var-get total-subsidies-distributed) amount)
         )
+        (map-set farmer-subsidy-history {
+            farmer-id: (get farmer-id subsidy-data),
+            subsidy-id: subsidy-id,
+        } {
+            block-height: stacks-block-height,
+            amount: amount,
+            subsidy-type: (get subsidy-type subsidy-data),
+            status: "approved",
+        })
         (ok true)
     )
 )
@@ -234,6 +265,15 @@
         (map-set subsidies { subsidy-id: subsidy-id }
             (merge subsidy-data { status: "rejected" })
         )
+        (map-set farmer-subsidy-history {
+            farmer-id: (get farmer-id subsidy-data),
+            subsidy-id: subsidy-id,
+        } {
+            block-height: stacks-block-height,
+            amount: (get amount subsidy-data),
+            subsidy-type: (get subsidy-type subsidy-data),
+            status: "rejected",
+        })
         (ok true)
     )
 )
@@ -324,4 +364,98 @@
             eligible: false,
         }
     )
+)
+
+(define-read-only (get-farmer-subsidy-history
+        (farmer-id principal)
+        (limit uint)
+        (offset uint)
+    )
+    (let (
+            (start-id (+ offset u1))
+            (max-id (var-get next-subsidy-id))
+            (calculated-end (+ start-id limit))
+            (end-id (if (<= calculated-end max-id)
+                calculated-end
+                max-id
+            ))
+            (results (list))
+        )
+        (get results
+            (fold check-and-collect
+                (list
+                    start-id                     (+ start-id u1)
+                    (+ start-id u2)                     (+ start-id u3)
+                    (+ start-id u4)
+                    (+ start-id u5)                     (+ start-id u6)
+                    (+ start-id u7)                     (+ start-id u8)
+                    (+ start-id u9)
+                ) {
+                farmer-id: farmer-id,
+                results: results,
+                end-id: end-id,
+            })
+        )
+    )
+)
+
+(define-private (check-and-collect
+        (subsidy-id uint)
+        (acc {
+            farmer-id: principal,
+            results: (list
+                10
+                (optional {
+                    block-height: uint,
+                    amount: uint,
+                    subsidy-type: (string-ascii 30),
+                    status: (string-ascii 20),
+                })
+            ),
+            end-id: uint,
+        })
+    )
+    (if (< subsidy-id (get end-id acc))
+        (merge acc { results: (unwrap-panic (as-max-len?
+            (append (get results acc)
+                (map-get? farmer-subsidy-history {
+                    farmer-id: (get farmer-id acc),
+                    subsidy-id: subsidy-id,
+                })
+            )
+            u10
+        )) }
+        )
+        acc
+    )
+)
+
+(define-read-only (get-farmer-subsidy-summary (farmer-id principal))
+    (let ((farmer-data (map-get? farmers { farmer-id: farmer-id })))
+        (match farmer-data
+            farmer-info
+            {
+                total-received: (get total-received farmer-info),
+                registration-block: (get registration-block farmer-info),
+                active-status: (get active farmer-info),
+                verification-status: (get verification-status farmer-info),
+            }
+            {
+                total-received: u0,
+                registration-block: u0,
+                active-status: false,
+                verification-status: false,
+            }
+        )
+    )
+)
+
+(define-read-only (get-subsidy-history-entry
+        (farmer-id principal)
+        (subsidy-id uint)
+    )
+    (map-get? farmer-subsidy-history {
+        farmer-id: farmer-id,
+        subsidy-id: subsidy-id,
+    })
 )
