@@ -65,6 +65,217 @@
 )
 
 (define-data-var next-subsidy-id uint u1)
+(define-data-var next-milestone-id uint u1)
+
+(define-map milestone-subsidies
+    { milestone-subsidy-id: uint }
+    {
+        farmer-id: principal,
+        subsidy-type: (string-ascii 30),
+        total-amount: uint,
+        milestones-count: uint,
+        amount-per-milestone: uint,
+        disbursed-milestones: uint,
+        created-block: uint,
+        expiry-block: uint,
+        active: bool,
+        description: (string-ascii 200),
+    }
+)
+
+(define-map milestones
+    {
+        milestone-subsidy-id: uint,
+        milestone-index: uint,
+    }
+    {
+        milestone-id: uint,
+        description: (string-ascii 150),
+        required-evidence: (string-ascii 100),
+        completion-deadline: uint,
+        amount: uint,
+        status: (string-ascii 20),
+        submitted-evidence: (string-ascii 200),
+        completion-block: uint,
+        verified-block: uint,
+    }
+)
+
+(define-public (create-milestone-subsidy
+        (subsidy-type (string-ascii 30))
+        (milestones-count uint)
+        (description (string-ascii 200))
+    )
+    (let (
+            (farmer-data (unwrap! (map-get? farmers { farmer-id: tx-sender })
+                ERR_FARMER_NOT_FOUND
+            ))
+            (subsidy-info (unwrap! (map-get? subsidy-types { type-name: subsidy-type })
+                ERR_INVALID_SUBSIDY_TYPE
+            ))
+            (milestone-subsidy-id (var-get next-milestone-id))
+            (total-calculated-amount (calculate-subsidy-amount (get farm-size farmer-data) subsidy-type))
+            (amount-per-milestone (/ total-calculated-amount milestones-count))
+        )
+        (asserts! (get active farmer-data) ERR_UNAUTHORIZED)
+        (asserts! (get verification-status farmer-data) ERR_UNAUTHORIZED)
+        (asserts! (get active subsidy-info) ERR_INVALID_SUBSIDY_TYPE)
+        (asserts! (var-get subsidy-program-active) ERR_UNAUTHORIZED)
+        (asserts! (> total-calculated-amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (and (> milestones-count u0) (<= milestones-count u10))
+            ERR_INVALID_AMOUNT
+        )
+        (map-set milestone-subsidies { milestone-subsidy-id: milestone-subsidy-id } {
+            farmer-id: tx-sender,
+            subsidy-type: subsidy-type,
+            total-amount: total-calculated-amount,
+            milestones-count: milestones-count,
+            amount-per-milestone: amount-per-milestone,
+            disbursed-milestones: u0,
+            created-block: stacks-block-height,
+            expiry-block: (+ stacks-block-height u105120),
+            active: true,
+            description: description,
+        })
+        (var-set next-milestone-id (+ milestone-subsidy-id u1))
+        (ok milestone-subsidy-id)
+    )
+)
+
+(define-public (setup-milestone
+        (milestone-subsidy-id uint)
+        (milestone-index uint)
+        (milestone-description (string-ascii 150))
+        (required-evidence (string-ascii 100))
+        (completion-deadline-offset uint)
+    )
+    (let (
+            (milestone-subsidy-data (unwrap!
+                (map-get? milestone-subsidies { milestone-subsidy-id: milestone-subsidy-id })
+                ERR_FARMER_NOT_FOUND
+            ))
+            (milestone-id (var-get next-milestone-id))
+        )
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (asserts! (get active milestone-subsidy-data) ERR_UNAUTHORIZED)
+        (asserts!
+            (< milestone-index (get milestones-count milestone-subsidy-data))
+            ERR_INVALID_AMOUNT
+        )
+        (asserts! (> completion-deadline-offset u0) ERR_INVALID_AMOUNT)
+        (map-set milestones {
+            milestone-subsidy-id: milestone-subsidy-id,
+            milestone-index: milestone-index,
+        } {
+            milestone-id: milestone-id,
+            description: milestone-description,
+            required-evidence: required-evidence,
+            completion-deadline: (+ (get created-block milestone-subsidy-data)
+                completion-deadline-offset
+            ),
+            amount: (get amount-per-milestone milestone-subsidy-data),
+            status: "pending",
+            submitted-evidence: "",
+            completion-block: u0,
+            verified-block: u0,
+        })
+        (var-set next-milestone-id (+ milestone-id u1))
+        (ok milestone-id)
+    )
+)
+
+(define-public (submit-milestone-completion
+        (milestone-subsidy-id uint)
+        (milestone-index uint)
+        (evidence (string-ascii 200))
+    )
+    (let (
+            (milestone-subsidy-data (unwrap!
+                (map-get? milestone-subsidies { milestone-subsidy-id: milestone-subsidy-id })
+                ERR_FARMER_NOT_FOUND
+            ))
+            (milestone-data (unwrap!
+                (map-get? milestones {
+                    milestone-subsidy-id: milestone-subsidy-id,
+                    milestone-index: milestone-index,
+                })
+                ERR_FARMER_NOT_FOUND
+            ))
+        )
+        (asserts! (is-eq tx-sender (get farmer-id milestone-subsidy-data))
+            ERR_UNAUTHORIZED
+        )
+        (asserts! (get active milestone-subsidy-data) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status milestone-data) "pending") ERR_UNAUTHORIZED)
+        (asserts!
+            (< stacks-block-height (get completion-deadline milestone-data))
+            ERR_SUBSIDY_EXPIRED
+        )
+        (asserts! (> (len evidence) u0) ERR_INVALID_AMOUNT)
+        (map-set milestones {
+            milestone-subsidy-id: milestone-subsidy-id,
+            milestone-index: milestone-index,
+        }
+            (merge milestone-data {
+                status: "submitted",
+                submitted-evidence: evidence,
+                completion-block: stacks-block-height,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (verify-and-disburse-milestone
+        (milestone-subsidy-id uint)
+        (milestone-index uint)
+    )
+    (let (
+            (milestone-subsidy-data (unwrap!
+                (map-get? milestone-subsidies { milestone-subsidy-id: milestone-subsidy-id })
+                ERR_FARMER_NOT_FOUND
+            ))
+            (milestone-data (unwrap!
+                (map-get? milestones {
+                    milestone-subsidy-id: milestone-subsidy-id,
+                    milestone-index: milestone-index,
+                })
+                ERR_FARMER_NOT_FOUND
+            ))
+            (farmer-data (unwrap!
+                (map-get? farmers { farmer-id: (get farmer-id milestone-subsidy-data) })
+                ERR_FARMER_NOT_FOUND
+            ))
+            (amount (get amount milestone-data))
+        )
+        (asserts! (is-contract-owner) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status milestone-data) "submitted")
+            ERR_UNAUTHORIZED
+        )
+        (asserts! (>= (var-get contract-balance) amount) ERR_INSUFFICIENT_FUNDS)
+        (try! (stx-transfer? amount tx-sender (get farmer-id milestone-subsidy-data)))
+        (map-set milestones {
+            milestone-subsidy-id: milestone-subsidy-id,
+            milestone-index: milestone-index,
+        }
+            (merge milestone-data {
+                status: "completed",
+                verified-block: stacks-block-height,
+            })
+        )
+        (map-set milestone-subsidies { milestone-subsidy-id: milestone-subsidy-id }
+            (merge milestone-subsidy-data { disbursed-milestones: (+ (get disbursed-milestones milestone-subsidy-data) u1) })
+        )
+        (map-set farmers { farmer-id: (get farmer-id milestone-subsidy-data) }
+            (merge farmer-data { total-received: (+ (get total-received farmer-data) amount) })
+        )
+        (var-set contract-balance (- (var-get contract-balance) amount))
+        (var-set total-subsidies-distributed
+            (+ (var-get total-subsidies-distributed) amount)
+        )
+        (ok true)
+    )
+)
 
 (define-private (is-contract-owner)
     (is-eq tx-sender CONTRACT_OWNER)
@@ -458,4 +669,55 @@
         farmer-id: farmer-id,
         subsidy-id: subsidy-id,
     })
+)
+
+(define-read-only (get-milestone-subsidy-info (milestone-subsidy-id uint))
+    (map-get? milestone-subsidies { milestone-subsidy-id: milestone-subsidy-id })
+)
+
+(define-read-only (get-milestone-info
+        (milestone-subsidy-id uint)
+        (milestone-index uint)
+    )
+    (map-get? milestones {
+        milestone-subsidy-id: milestone-subsidy-id,
+        milestone-index: milestone-index,
+    })
+)
+
+(define-read-only (get-milestone-progress (milestone-subsidy-id uint))
+    (match (map-get? milestone-subsidies { milestone-subsidy-id: milestone-subsidy-id })
+        milestone-data
+        {
+            total-milestones: (get milestones-count milestone-data),
+            completed-milestones: (get disbursed-milestones milestone-data),
+            remaining-milestones: (- (get milestones-count milestone-data)
+                (get disbursed-milestones milestone-data)
+            ),
+            total-amount: (get total-amount milestone-data),
+            disbursed-amount: (* (get disbursed-milestones milestone-data)
+                (get amount-per-milestone milestone-data)
+            ),
+            remaining-amount: (*
+                (- (get milestones-count milestone-data)
+                    (get disbursed-milestones milestone-data)
+                )
+                (get amount-per-milestone milestone-data)
+            ),
+            completion-percentage: (/ (* (get disbursed-milestones milestone-data) u100)
+                (get milestones-count milestone-data)
+            ),
+            active: (get active milestone-data),
+        }
+        {
+            total-milestones: u0,
+            completed-milestones: u0,
+            remaining-milestones: u0,
+            total-amount: u0,
+            disbursed-amount: u0,
+            remaining-amount: u0,
+            completion-percentage: u0,
+            active: false,
+        }
+    )
 )
