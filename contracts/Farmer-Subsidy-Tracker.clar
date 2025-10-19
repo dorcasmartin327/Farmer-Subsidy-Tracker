@@ -9,6 +9,15 @@
 (define-constant ERR_INVALID_FARM_SIZE (err u107))
 (define-constant ERR_PAYMENT_FAILED (err u108))
 
+;; Mutual Aid Fund Error Constants
+(define-constant ERR_INSUFFICIENT_CONTRIBUTION (err u300))
+(define-constant ERR_REQUEST_NOT_FOUND (err u301))
+(define-constant ERR_ALREADY_VOTED (err u302))
+(define-constant ERR_REQUEST_ALREADY_RESOLVED (err u303))
+(define-constant ERR_INSUFFICIENT_POOL_FUNDS (err u304))
+(define-constant ERR_NOT_ELIGIBLE_VOTER (err u305))
+(define-constant ERR_INVALID_REQUEST_STATUS (err u306))
+
 (define-data-var contract-balance uint u0)
 (define-data-var total-farmers uint u0)
 (define-data-var total-subsidies-distributed uint u0)
@@ -64,7 +73,46 @@
     }
 )
 
+;; Mutual Aid Fund Data Maps
+(define-map mutual-aid-contributions
+    { farmer: principal }
+    {
+        total-contributed: uint,
+        contribution-count: uint,
+        last-contribution-block: uint,
+    }
+)
+
+(define-map mutual-aid-requests
+    { request-id: uint }
+    {
+        farmer: principal,
+        amount-requested: uint,
+        reason: (string-utf8 500),
+        votes-for: uint,
+        votes-against: uint,
+        status: (string-ascii 20),
+        created-at-block: uint,
+        resolved-at-block: uint,
+    }
+)
+
+(define-map mutual-aid-votes
+    { request-id: uint, voter: principal }
+    {
+        vote: bool,
+        voted-at-block: uint,
+    }
+)
+
 (define-data-var next-subsidy-id uint u1)
+(define-data-var next-milestone-id uint u1)
+
+;; Mutual Aid Fund Data Variables
+(define-data-var mutual-aid-pool-balance uint u0)
+(define-data-var mutual-aid-request-counter uint u0)
+(define-data-var minimum-contribution uint u1000000)
+(define-data-var minimum-votes-required uint u3)
 
 (define-private (is-contract-owner)
     (is-eq tx-sender CONTRACT_OWNER)
@@ -458,4 +506,260 @@
         farmer-id: farmer-id,
         subsidy-id: subsidy-id,
     })
+)
+
+;; =============================================================================
+;; MUTUAL AID FUND FEATURE
+;; =============================================================================
+
+;; Allow farmers to contribute STX to the mutual aid pool
+(define-public (contribute-to-mutual-aid (amount uint))
+    (let (
+        (farmer-data (unwrap! (map-get? farmers { farmer-id: tx-sender })
+            ERR_FARMER_NOT_FOUND
+        ))
+        (current-contributions (default-to
+            { total-contributed: u0, contribution-count: u0, last-contribution-block: u0 }
+            (map-get? mutual-aid-contributions { farmer: tx-sender })
+        ))
+    )
+        ;; Validate farmer eligibility and contribution amount
+        (asserts! (get active farmer-data) ERR_UNAUTHORIZED)
+        (asserts! (get verification-status farmer-data) ERR_UNAUTHORIZED)
+        (asserts! (>= amount (var-get minimum-contribution)) ERR_INSUFFICIENT_CONTRIBUTION)
+        
+        ;; Transfer STX to contract
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        ;; Update contribution records
+        (map-set mutual-aid-contributions { farmer: tx-sender } {
+            total-contributed: (+ (get total-contributed current-contributions) amount),
+            contribution-count: (+ (get contribution-count current-contributions) u1),
+            last-contribution-block: stacks-block-height,
+        })
+        
+        ;; Update pool balance
+        (var-set mutual-aid-pool-balance (+ (var-get mutual-aid-pool-balance) amount))
+        
+        (ok true)
+    )
+)
+
+;; Create an aid request for community voting
+(define-public (create-aid-request (amount-requested uint) (reason (string-utf8 500)))
+    (let (
+        (farmer-data (unwrap! (map-get? farmers { farmer-id: tx-sender })
+            ERR_FARMER_NOT_FOUND
+        ))
+        (request-id (var-get mutual-aid-request-counter))
+    )
+        ;; Validate farmer eligibility and request parameters
+        (asserts! (get active farmer-data) ERR_UNAUTHORIZED)
+        (asserts! (get verification-status farmer-data) ERR_UNAUTHORIZED)
+        (asserts! (> amount-requested u0) ERR_INVALID_AMOUNT)
+        (asserts! (> (len reason) u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= amount-requested (var-get mutual-aid-pool-balance)) ERR_INSUFFICIENT_POOL_FUNDS)
+        
+        ;; Create aid request
+        (map-set mutual-aid-requests { request-id: request-id } {
+            farmer: tx-sender,
+            amount-requested: amount-requested,
+            reason: reason,
+            votes-for: u0,
+            votes-against: u0,
+            status: "pending",
+            created-at-block: stacks-block-height,
+            resolved-at-block: u0,
+        })
+        
+        ;; Increment request counter
+        (var-set mutual-aid-request-counter (+ request-id u1))
+        
+        (ok request-id)
+    )
+)
+
+;; Vote on an aid request (only contributing farmers can vote)
+(define-public (vote-on-aid-request (request-id uint) (vote bool))
+    (let (
+        (farmer-data (unwrap! (map-get? farmers { farmer-id: tx-sender })
+            ERR_FARMER_NOT_FOUND
+        ))
+        (aid-request (unwrap! (map-get? mutual-aid-requests { request-id: request-id })
+            ERR_REQUEST_NOT_FOUND
+        ))
+        (farmer-contributions (map-get? mutual-aid-contributions { farmer: tx-sender }))
+        (existing-vote (map-get? mutual-aid-votes { request-id: request-id, voter: tx-sender }))
+    )
+        ;; Validate voter eligibility
+        (asserts! (get active farmer-data) ERR_UNAUTHORIZED)
+        (asserts! (get verification-status farmer-data) ERR_UNAUTHORIZED)
+        (asserts! (is-some farmer-contributions) ERR_NOT_ELIGIBLE_VOTER)
+        (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+        (asserts! (is-eq (get status aid-request) "pending") ERR_INVALID_REQUEST_STATUS)
+        
+        ;; Record vote
+        (map-set mutual-aid-votes { request-id: request-id, voter: tx-sender } {
+            vote: vote,
+            voted-at-block: stacks-block-height,
+        })
+        
+        ;; Update vote counts
+        (if vote
+            (map-set mutual-aid-requests { request-id: request-id }
+                (merge aid-request { votes-for: (+ (get votes-for aid-request) u1) })
+            )
+            (map-set mutual-aid-requests { request-id: request-id }
+                (merge aid-request { votes-against: (+ (get votes-against aid-request) u1) })
+            )
+        )
+        
+        (ok true)
+    )
+)
+
+;; Finalize aid request based on community voting
+(define-public (finalize-aid-request (request-id uint))
+    (let (
+        (aid-request (unwrap! (map-get? mutual-aid-requests { request-id: request-id })
+            ERR_REQUEST_NOT_FOUND
+        ))
+        (farmer-data (unwrap! (map-get? farmers { farmer-id: (get farmer aid-request) })
+            ERR_FARMER_NOT_FOUND
+        ))
+        (votes-for (get votes-for aid-request))
+        (votes-against (get votes-against aid-request))
+        (total-votes (+ votes-for votes-against))
+        (required-votes (var-get minimum-votes-required))
+        (amount (get amount-requested aid-request))
+    )
+        ;; Validate request status and voting requirements
+        (asserts! (is-eq (get status aid-request) "pending") ERR_REQUEST_ALREADY_RESOLVED)
+        (asserts! (>= total-votes required-votes) ERR_INVALID_REQUEST_STATUS)
+        
+        ;; Check if request is approved (more votes for than against)
+        (if (> votes-for votes-against)
+            (begin
+                ;; Approve and disburse funds
+                (asserts! (>= (var-get mutual-aid-pool-balance) amount) ERR_INSUFFICIENT_POOL_FUNDS)
+                (try! (as-contract (stx-transfer? amount tx-sender (get farmer aid-request))))
+                
+                ;; Update pool balance
+                (var-set mutual-aid-pool-balance (- (var-get mutual-aid-pool-balance) amount))
+                
+                ;; Update farmer's total received
+                (map-set farmers { farmer-id: (get farmer aid-request) }
+                    (merge farmer-data { total-received: (+ (get total-received farmer-data) amount) })
+                )
+                
+                ;; Update request status
+                (map-set mutual-aid-requests { request-id: request-id }
+                    (merge aid-request {
+                        status: "approved",
+                        resolved-at-block: stacks-block-height,
+                    })
+                )
+                
+                (ok "approved")
+            )
+            (begin
+                ;; Reject request
+                (map-set mutual-aid-requests { request-id: request-id }
+                    (merge aid-request {
+                        status: "rejected",
+                        resolved-at-block: stacks-block-height,
+                    })
+                )
+                
+                (ok "rejected")
+            )
+        )
+    )
+)
+
+;; Emergency withdrawal for contributors (with 10% penalty)
+(define-public (withdraw-contribution (amount uint))
+    (let (
+        (farmer-data (unwrap! (map-get? farmers { farmer-id: tx-sender })
+            ERR_FARMER_NOT_FOUND
+        ))
+        (contributions (unwrap! (map-get? mutual-aid-contributions { farmer: tx-sender })
+            ERR_FARMER_NOT_FOUND
+        ))
+        (available-amount (get total-contributed contributions))
+        (penalty (/ amount u10))  ;; 10% penalty
+        (withdrawal-amount (- amount penalty))
+    )
+        ;; Validate withdrawal
+        (asserts! (get active farmer-data) ERR_UNAUTHORIZED)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= amount available-amount) ERR_INSUFFICIENT_CONTRIBUTION)
+        (asserts! (>= (var-get mutual-aid-pool-balance) amount) ERR_INSUFFICIENT_POOL_FUNDS)
+        
+        ;; Transfer funds (minus penalty)
+        (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
+        
+        ;; Update contribution records
+        (map-set mutual-aid-contributions { farmer: tx-sender }
+            (merge contributions {
+                total-contributed: (- (get total-contributed contributions) amount),
+                last-contribution-block: stacks-block-height,
+            })
+        )
+        
+        ;; Update pool balance (penalty remains in pool)
+        (var-set mutual-aid-pool-balance (- (var-get mutual-aid-pool-balance) withdrawal-amount))
+        
+        (ok withdrawal-amount)
+    )
+)
+
+;; =============================================================================
+;; MUTUAL AID FUND READ-ONLY FUNCTIONS
+;; =============================================================================
+
+;; Get mutual aid pool balance
+(define-read-only (get-mutual-aid-pool-balance)
+    (var-get mutual-aid-pool-balance)
+)
+
+;; Get farmer's contribution history
+(define-read-only (get-farmer-contributions (farmer principal))
+    (map-get? mutual-aid-contributions { farmer: farmer })
+)
+
+;; Get aid request details
+(define-read-only (get-aid-request (request-id uint))
+    (map-get? mutual-aid-requests { request-id: request-id })
+)
+
+;; Get voting statistics for an aid request
+(define-read-only (get-aid-request-votes (request-id uint))
+    (match (map-get? mutual-aid-requests { request-id: request-id })
+        request-data
+        (some {
+            request-id: request-id,
+            votes-for: (get votes-for request-data),
+            votes-against: (get votes-against request-data),
+            total-votes: (+ (get votes-for request-data) (get votes-against request-data)),
+            status: (get status request-data),
+        })
+        none
+    )
+)
+
+;; Check if a farmer has voted on a specific request
+(define-read-only (has-voted-on-request (request-id uint) (farmer principal))
+    (is-some (map-get? mutual-aid-votes { request-id: request-id, voter: farmer }))
+)
+
+;; Get mutual aid fund statistics
+(define-read-only (get-mutual-aid-stats)
+    {
+        pool-balance: (var-get mutual-aid-pool-balance),
+        total-requests: (var-get mutual-aid-request-counter),
+        minimum-contribution: (var-get minimum-contribution),
+        minimum-votes-required: (var-get minimum-votes-required),
+        current-block: stacks-block-height,
+    }
 )
